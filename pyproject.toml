@@ -1,0 +1,14 @@
+[project]
+name = "ltc-cuda"
+version = "0.1.0"
+description = "Fast CUDA kernels for Liquid Time-Constant (LTC) neural networks"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.9"
+dependencies = [
+    "torch>=2.0",
+    "ncps",
+]
+
+[project.urls]
+Repository = "https://github.com/TODO/ltc-cuda"

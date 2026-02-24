@@ -1,0 +1,11 @@
+__pycache__/
+*.pyd
+*.so
+*.o
+_cuda_build/
+*.egg-info/
+dist/
+build/
+bench_results.json
+.venv/
+*.pyc
