@@ -11,13 +11,15 @@ Measured on GTX 1080 (sm_61), B=24, T=8, D=128, H=64, 6 ODE unfolds:
 | Forward | 11.2 ms | 1.85 ms | **6.0x** |
 | Backward | 66 ms | 15 ms | **4.4x** |
 | **Total** | **89 ms** | **17 ms** | **5.3x** |
-| Peak Memory | 71 MB | 2 MB | **35x** |
+| Peak Memory* | 71 MB | 2 MB | **35x** |
 | Kernel Launches | ~2000 | 16 | **125x** |
+
+*\*Peak memory measured via `torch.cuda.max_memory_allocated()` during forward+backward. TorchScript stores intermediate activations for autograd; CUDA kernels recompute them in the backward pass. Reproduce with `python bench_ltc.py --save`.*
 
 ## Quick Start
 
 ```bash
-git clone https://github.com/TODO/ltc-cuda.git
+git clone https://github.com/clubsnake/ltc-cuda.git
 cd ltc-cuda
 pip install -r requirements.txt
 python bench_ltc.py

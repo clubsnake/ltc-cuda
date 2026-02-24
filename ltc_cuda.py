@@ -91,7 +91,7 @@ def _setup_msvc_env() -> str | None:
     # Ensure vswhere.exe is on PATH — nvcc's internal vcvars call needs it
     vswhere_dir = r"C:\Program Files (x86)\Microsoft Visual Studio\Installer"
     if os.path.isdir(vswhere_dir) and vswhere_dir not in os.environ.get("PATH", ""):
-        os.environ["PATH"] = vswhere_dir + ";" + os.environ.get("PATH", "")
+        os.environ["PATH"] = vswhere_dir + os.pathsep + os.environ.get("PATH", "")
 
     # Find cl.exe from the now-populated PATH
     msvc_patterns = [
@@ -141,9 +141,8 @@ def _try_load_cuda_kernels():
     if not torch.cuda.is_available():
         return False
 
-    # Build directory for cached .pyd
-    ext_dir = os.path.join(os.path.dirname(__file__), "..", "..", "_cuda_build")
-    ext_dir = os.path.abspath(ext_dir)
+    # Build directory for cached .pyd/.so (inside project directory)
+    ext_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_cuda_build")
     os.makedirs(ext_dir, exist_ok=True)
 
     # Fast path: try loading cached .pyd first, skipping MSVC/nvcc setup entirely.
@@ -188,10 +187,6 @@ def _try_load_cuda_kernels():
             else:
                 logger.warning("Could not set up MSVC environment for CUDA compilation")
                 return False
-        else:
-            cuda_arch = os.environ.get("TORCH_CUDA_ARCH_LIST", "6.1")
-            extra_cuda_cflags.append(f"-arch=sm_{cuda_arch.replace('.', '')}")
-
         # Point CUDA_HOME to the toolkit matching PyTorch's runtime.
         # Must be set AFTER _setup_msvc_env() which may overwrite CUDA_PATH
         # with an older toolkit version from the system PATH.
@@ -201,15 +196,16 @@ def _try_load_cuda_kernels():
             os.environ["CUDA_PATH"] = cuda_home
             # Ensure the correct nvcc is found first on PATH
             cuda_bin = os.path.join(cuda_home, "bin")
-            os.environ["PATH"] = cuda_bin + ";" + os.environ.get("PATH", "")
+            os.environ["PATH"] = cuda_bin + os.pathsep + os.environ.get("PATH", "")
             # PyTorch caches CUDA_HOME at import time — override the module var
             import torch.utils.cpp_extension as _cpp_ext
             _cpp_ext.CUDA_HOME = cuda_home
             logger.info("Using CUDA toolkit: %s", cuda_home)
 
-        # Only compile for the GPU we have (GTX 1080 = sm_61)
+        # Auto-detect GPU compute capability if not explicitly set
         if "TORCH_CUDA_ARCH_LIST" not in os.environ:
-            os.environ["TORCH_CUDA_ARCH_LIST"] = "6.1"
+            cap = torch.cuda.get_device_capability()
+            os.environ["TORCH_CUDA_ARCH_LIST"] = f"{cap[0]}.{cap[1]}"
 
         _cuda_module = load(
             name="ltc_cuda_kernels",

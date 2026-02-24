@@ -11,4 +11,4 @@ dependencies = [
 ]
 
 [project.urls]
-Repository = "https://github.com/TODO/ltc-cuda"
+Repository = "https://github.com/clubsnake/ltc-cuda"
