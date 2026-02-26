@@ -1,6 +1,6 @@
 # ltc-cuda
 
-Drop-in CUDA acceleration for [Liquid Time-Constant (LTC)](https://arxiv.org/abs/2006.04439) neural networks. **5.3x faster forward+backward, 35x less memory** compared to TorchScript.
+Drop-in CUDA acceleration for [Liquid Time-Constant (LTC)](https://arxiv.org/abs/2006.04439) neural networks. **8x faster forward+backward, 35x less memory** compared to TorchScript.
 
 ## Performance
 
@@ -8,9 +8,9 @@ Measured on GTX 1080 (sm_61), B=24, T=8, D=128, H=64, 6 ODE unfolds:
 
 | Metric | TorchScript | CUDA Kernels | Speedup |
 |--------|-------------|--------------|---------|
-| Forward | 11.2 ms | 1.85 ms | **6.0x** |
-| Backward | 66 ms | 15 ms | **4.4x** |
-| **Total** | **89 ms** | **17 ms** | **5.3x** |
+| Forward | 14.7 ms | 1.7 ms | **8.6x** |
+| Backward | 74 ms | 11 ms | **6.8x** |
+| **Total** | **89 ms** | **12.7 ms** | **7.0x** |
 | Peak Memory* | 71 MB | 2 MB | **35x** |
 | Kernel Launches | ~2000 | 16 | **125x** |
 
@@ -101,12 +101,13 @@ The standard LTC forward pass requires **~2000 CUDA kernel launches** per step (
 |--------|-----------|-------------|
 | `sensory_fwd` | 48 | Input conductance: `w * sigmoid(sigma * (x - mu))`, reduces (B,D,H) to (B,H) |
 | `ode_fwd` | 40 | One ODE unfold step: recurrent conductance + numerator/denominator update |
-| `sensory_bwd` | 26 | Backward pass for sensory synapses |
-| `ode_bwd_state` | 56 | State gradients through ODE unfolds |
-| `ode_bwd_params` | 31 | Parameter gradients (w, mu, sigma, erev, cm, gleak, vleak) |
+| `sensory_bwd` | 26 | Backward pass for sensory synapses (per-batch gradient accumulation) |
+| `ode_bwd_fused` | ~56 | Fused state + parameter gradients through ODE unfolds |
 
 **Key design decisions:**
-- **Split backward**: The monolithic backward kernel (74 registers) was split into state (56) + params (31) to reduce register pressure and improve occupancy
+- **Per-batch gradient accumulation**: Each batch element accumulates into its own gradient buffer, then a final reduction sums across batches. Eliminates atomicAdd contention that caused 6x slowdown in the backward pass.
+- **Fused backward kernel**: State and parameter gradients are computed in a single kernel launch per ODE unfold, reducing launch overhead by ~40%.
+- **Pre-transposed matrices**: Forward pass returns transposed weight matrices that backward reuses directly, avoiding 8 transpose operations.
 - **C++ T-loop wrappers**: `ltc_full_forward()` and `ltc_full_backward()` loop over timesteps in C++, eliminating Python-level dispatch for each timestep
 - **fp32 only**: LTC's 6 ODE unfolds accumulate numerical error; fp16 diverges. The kernels use `--use_fast_math` for speed but maintain fp32 precision throughout
 - **Stride-aware sensory kernel**: Accepts non-contiguous input tensors, avoiding `.contiguous()` copies
@@ -167,7 +168,7 @@ The TorchScript implementation decomposes this into hundreds of small PyTorch op
 |------|-------------|
 | `ltc.py` | LTC module with TorchScript fallback + CUDA dispatch |
 | `ltc_cuda.py` | CUDA kernel JIT loader + autograd Function wrapper |
-| `csrc/ltc_kernels.cu` | 5 CUDA kernels (1129 lines) |
+| `csrc/ltc_kernels.cu` | CUDA kernels with fused backward + per-batch accumulators (~1300 lines) |
 | `recurrent.py` | LSTM wrapper for benchmark comparison |
 | `bench_ltc.py` | Benchmark script |
 | `test_ltc_cuda.py` | CUDA vs TorchScript correctness tests |

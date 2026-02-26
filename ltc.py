@@ -306,6 +306,14 @@ class TrueLiquidTimeConstant(nn.Module):
                 self.ode_unfolds, self.epsilon,
             )
         else:
+            if not getattr(self, '_ts_fallback_warned', False):
+                logger.warning(
+                    "LTC using TorchScript fallback (5-8x slower): "
+                    "has_cuda=%s, is_cuda=%s, dtype=%s, force_ts=%s",
+                    _HAS_CUDA_KERNELS, x_seq.is_cuda, x_seq.dtype,
+                    getattr(self, '_force_torchscript', False),
+                )
+                self._ts_fallback_warned = True
             outputs, state = _ltc_forward_loop_jit(
                 x_seq, state,
                 w_pos, w_erev, self.mu, self.sigma,

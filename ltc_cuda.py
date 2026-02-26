@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 
 _HAS_CUDA_KERNELS = False
 _cuda_module = None
+_CUDA_EXT_NAME = "ltc_cuda_kernels_v2"
 
 
 def _find_cuda_home() -> str | None:
@@ -116,13 +117,13 @@ def _try_load_cached_pyd(ext_dir: str) -> bool:
     global _HAS_CUDA_KERNELS, _cuda_module
     import importlib.util
 
-    pyd_path = os.path.join(ext_dir, "ltc_cuda_kernels.pyd" if sys.platform == "win32"
-                            else "ltc_cuda_kernels.so")
+    pyd_path = os.path.join(ext_dir, f"{_CUDA_EXT_NAME}.pyd" if sys.platform == "win32"
+                            else f"{_CUDA_EXT_NAME}.so")
     if not os.path.isfile(pyd_path):
         return False
 
     try:
-        spec = importlib.util.spec_from_file_location("ltc_cuda_kernels", pyd_path)
+        spec = importlib.util.spec_from_file_location(_CUDA_EXT_NAME, pyd_path)
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
         _cuda_module = mod
@@ -208,7 +209,7 @@ def _try_load_cuda_kernels():
             os.environ["TORCH_CUDA_ARCH_LIST"] = f"{cap[0]}.{cap[1]}"
 
         _cuda_module = load(
-            name="ltc_cuda_kernels",
+            name=_CUDA_EXT_NAME,
             sources=[kernel_path],
             extra_cuda_cflags=extra_cuda_cflags,
             build_directory=ext_dir,
@@ -281,10 +282,19 @@ class LTCCudaForward(torch.autograd.Function):
             v_buffers_stacked = result[2]     # (T, unfolds, B, H)
             w_num_sens_stacked = result[3]    # (T, B, H)
             w_den_sens_stacked = result[4]    # (T, B, H)
+            w_pos_t = result[5]               # (H, H) transposed
+            w_erev_t = result[6]              # (H, H) transposed
+            mu_t = result[7]                  # (H, H) transposed
+            sigma_t = result[8]               # (H, H) transposed
+            sensory_mu_t = result[9]          # (H, D) transposed
+            sensory_sigma_t = result[10]      # (H, D) transposed
+            sensory_erev_t = result[11]       # (H, D) transposed
+            sensory_w_pos_t = result[12]      # (H, D) transposed
             ctx.save_for_backward(
-                x_seq, state, w_pos, w_erev, mu, sigma,
-                sensory_mu, sensory_sigma, sensory_erev, sensory_w_pos,
                 cm_t, gleak_pos, vleak,
+                x_seq, state,
+                w_pos_t, w_erev_t, mu_t, sigma_t,
+                sensory_mu_t, sensory_sigma_t, sensory_erev_t, sensory_w_pos_t,
                 v_buffers_stacked, w_num_sens_stacked, w_den_sens_stacked,
             )
         ctx.ode_unfolds = ode_unfolds
@@ -300,12 +310,13 @@ class LTCCudaForward(torch.autograd.Function):
         - 11 torch.zeros_like() calls
         - 88 Python-level += operations (11 params × 8 timesteps)
         - Python loop overhead per timestep
-        Uses split two-pass backward kernels (Phase 1) with shared memory
-        prologue scalars (Phase 3) for reduced register pressure.
+        Uses fused backward kernels with per-batch gradient accumulation to
+        reduce launch overhead and atomic contention.
         """
-        (x_seq, state, w_pos, w_erev, mu, sigma,
-         sensory_mu, sensory_sigma, sensory_erev, sensory_w_pos,
-         cm_t, gleak_pos, vleak,
+        (cm_t, gleak_pos, vleak,
+         x_seq, state,
+         w_pos_t, w_erev_t, mu_t, sigma_t,
+         sensory_mu_t, sensory_sigma_t, sensory_erev_t, sensory_w_pos_t,
          v_buffers_stacked, w_num_sens_stacked, w_den_sens_stacked,
         ) = ctx.saved_tensors
 
@@ -318,8 +329,9 @@ class LTCCudaForward(torch.autograd.Function):
 
         # Single C++ call for the entire backward pass
         results = _cuda_module.ltc_full_backward(
-            x_seq, state, w_pos, w_erev, mu, sigma,
-            sensory_mu, sensory_sigma, sensory_erev, sensory_w_pos,
+            x_seq, state,
+            w_pos_t, w_erev_t, mu_t, sigma_t,
+            sensory_mu_t, sensory_sigma_t, sensory_erev_t, sensory_w_pos_t,
             cm_t, gleak_pos, vleak,
             v_buffers_stacked, w_num_sens_stacked, w_den_sens_stacked,
             grad_outputs, grad_state,

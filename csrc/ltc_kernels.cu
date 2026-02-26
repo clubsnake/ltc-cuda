@@ -206,6 +206,16 @@ struct SensoryGradPtrs {
     float* grad_erev;     // (D, H)
 };
 
+// Per-batch sensory grads to avoid atomic contention on (H,D) accumulators.
+// Layout is flattened (B,H,D); wrapper reduces over B after T-loop.
+struct SensoryGradBatchPtrs {
+    float* grad_sigma_batch;   // (B, H, D)
+    float* grad_mu_batch;      // (B, H, D)
+    float* grad_w_pos_batch;   // (B, H, D)
+    float* grad_erev_batch;    // (B, H, D)
+    float* grad_inputs_batch;  // (B, H, D)
+};
+
 template <int BLOCK_H>
 __launch_bounds__(32 * BLOCK_H, 8)
 __global__ void ltc_sensory_bwd_kernel(
@@ -266,6 +276,66 @@ __global__ void ltc_sensory_bwd_kernel(
 
         // Input gradient
         atomicAdd(&grad_inputs[b * D + d], dz * sig);
+    }
+}
+
+template <int BLOCK_H>
+__launch_bounds__(32 * BLOCK_H, 8)
+__global__ void ltc_sensory_bwd_batch_kernel(
+    const float* __restrict__ grad_w_num,     // (B, H)
+    const float* __restrict__ grad_w_den,     // (B, H)
+    const float* __restrict__ inputs,         // (B, D) or strided
+    const float* __restrict__ sensory_sigma,  // (H, D)
+    const float* __restrict__ sensory_mu,     // (H, D)
+    const float* __restrict__ sensory_w_pos,  // (H, D)
+    const float* __restrict__ sensory_erev,   // (H, D)
+    const SensoryGradBatchPtrs grad_ptrs,     // per-batch outputs
+    int B, int D, int H,
+    int input_stride                          // stride between batch rows for inputs
+) {
+    const int h = blockIdx.x * BLOCK_H + threadIdx.y;
+    const int b = blockIdx.y;
+    const int lane = threadIdx.x;
+
+    if (b >= B || h >= H) return;
+
+    float* const g_sigma_batch = grad_ptrs.grad_sigma_batch;
+    float* const g_mu_batch = grad_ptrs.grad_mu_batch;
+    float* const g_w_pos_batch = grad_ptrs.grad_w_pos_batch;
+    float* const g_erev_batch = grad_ptrs.grad_erev_batch;
+    float* const g_inputs_batch = grad_ptrs.grad_inputs_batch;
+
+    float dw_num = grad_w_num[b * H + h];
+    float dw_den = grad_w_den[b * H + h];
+    const float* inp_b = inputs + b * input_stride;
+
+    #pragma unroll 1
+    for (int d = lane; d < D; d += 32) {
+        int idx_hd = h * D + d;
+        int idx_bhd = (b * H + h) * D + d;
+
+        float x = __ldg(&inp_b[d]);
+        float sig = __ldg(&sensory_sigma[idx_hd]);
+        float m = __ldg(&sensory_mu[idx_hd]);
+        float w = __ldg(&sensory_w_pos[idx_hd]);
+        float erev = __ldg(&sensory_erev[idx_hd]);
+
+        float z = sig * (x - m);
+        float act = __fdividef(1.0f, 1.0f + __expf(-z));
+        float act_deriv = act * (1.0f - act);
+        float w_act = w * act;
+
+        float dw_act = dw_num * erev + dw_den;
+        float dact = dw_act * w;
+        float dz = dact * act_deriv;
+
+        // Per-batch params accumulate over timesteps (no atomics needed).
+        g_sigma_batch[idx_bhd] += dz * (x - m);
+        g_mu_batch[idx_bhd] += dz * (-sig);
+        g_w_pos_batch[idx_bhd] += dw_act * act;
+        g_erev_batch[idx_bhd] += dw_num * w_act;
+        // Per-timestep input grad; reduced over H in wrapper.
+        g_inputs_batch[idx_bhd] = dz * sig;
     }
 }
 
@@ -469,6 +539,131 @@ __global__ void ltc_ode_step_bwd_params_kernel(
         atomicAdd(&grad_w_pos[idx], dw_den * act);
         atomicAdd(&grad_mu[idx], dz * (-sig));
         atomicAdd(&grad_sigma[idx], dz * (v_i - m));
+    }
+}
+
+
+// Fused backward kernel: combines state path + per-synapse parameter grads.
+// Eliminates one kernel launch per unfold and avoids atomics on parameter grads
+// by writing per-batch gradients (B,H,H) that are reduced after the T-loop.
+template <int BLOCK_J>
+__launch_bounds__(32 * BLOCK_J, 4)
+__global__ void ltc_ode_step_bwd_fused_kernel(
+    const float* __restrict__ v_pre,          // (B, H)
+    const float* __restrict__ w_pos,          // (H, H)
+    const float* __restrict__ w_erev,         // (H, H)
+    const float* __restrict__ mu,             // (H, H)
+    const float* __restrict__ sigma,          // (H, H)
+    const float* __restrict__ w_num_sensory,  // (B, H)
+    const float* __restrict__ w_den_sensory,  // (B, H)
+    const float* __restrict__ cm_t,           // (H,)
+    const float* __restrict__ gleak_pos,      // (H,)
+    const float* __restrict__ vleak,          // (H,)
+    const float* __restrict__ grad_v_new,     // (B, H)
+    float* __restrict__ grad_v_pre,           // (B, H)
+    float* __restrict__ grad_w_num_sensory,   // (B, H), accumulated over unfolds
+    float* __restrict__ grad_w_den_sensory,   // (B, H), accumulated over unfolds
+    float* __restrict__ grad_cm_batch,        // (B, H)
+    float* __restrict__ grad_gleak_batch,     // (B, H)
+    float* __restrict__ grad_vleak_batch,     // (B, H)
+    float* __restrict__ grad_w_pos_batch,     // (B, H, H)
+    float* __restrict__ grad_w_erev_batch,    // (B, H, H)
+    float* __restrict__ grad_mu_batch,        // (B, H, H)
+    float* __restrict__ grad_sigma_batch,     // (B, H, H)
+    int B, int H, float epsilon
+) {
+    const int j = blockIdx.x * BLOCK_J + threadIdx.y;
+    const int b = blockIdx.y;
+    const int lane = threadIdx.x;
+
+    if (b >= B) return;
+
+    extern __shared__ float smem[];
+    float* v_shared = smem;
+    float* cm_shared = smem + H;
+    float* gleak_shared = smem + 2 * H;
+    float* vleak_shared = smem + 3 * H;
+
+    for (int idx = threadIdx.y * 32 + lane; idx < H; idx += BLOCK_J * 32) {
+        v_shared[idx] = v_pre[b * H + idx];
+        cm_shared[idx] = __ldg(&cm_t[idx]);
+        gleak_shared[idx] = __ldg(&gleak_pos[idx]);
+        vleak_shared[idx] = __ldg(&vleak[idx]);
+    }
+    __syncthreads();
+
+    if (j >= H) return;
+
+    float cm_j = cm_shared[j];
+    float gleak_j = gleak_shared[j];
+    float vleak_j = vleak_shared[j];
+    float w_num_sens_j = __ldg(&w_num_sensory[b * H + j]);
+    float w_den_sens_j = __ldg(&w_den_sensory[b * H + j]);
+    float v_pre_j = v_shared[j];
+
+    float local_num = 0.0f;
+    float local_den = 0.0f;
+    for (int i = lane; i < H; i += 32) {
+        int idx = j * H + i;
+        float v_i = v_shared[i];
+        float sig = __ldg(&sigma[idx]);
+        float m = __ldg(&mu[idx]);
+        float z = sig * (v_i - m);
+        float act = __fdividef(1.0f, 1.0f + __expf(-z));
+        local_num += act * __ldg(&w_erev[idx]);
+        local_den += __ldg(&w_pos[idx]) * act;
+    }
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        local_num += __shfl_down_sync(WARP_MASK, local_num, offset);
+        local_den += __shfl_down_sync(WARP_MASK, local_den, offset);
+    }
+
+    float w_num_j = __shfl_sync(WARP_MASK, local_num, 0) + w_num_sens_j;
+    float w_den_j = __shfl_sync(WARP_MASK, local_den, 0) + w_den_sens_j;
+    float denom = cm_j + gleak_j + w_den_j + epsilon;
+    float v_new = (cm_j * v_pre_j + gleak_j * vleak_j + w_num_j) / denom;
+
+    float dv = grad_v_new[b * H + j];
+    float inv_denom = 1.0f / denom;
+    float dw_num = dv * inv_denom;
+    float dw_den = -dv * v_new * inv_denom;
+
+    if (lane == 0) {
+        int idx_bh = b * H + j;
+        grad_w_num_sensory[idx_bh] += dw_num;
+        grad_w_den_sensory[idx_bh] += dw_den;
+        grad_cm_batch[idx_bh] += dv * (v_pre_j - v_new) * inv_denom;
+        grad_gleak_batch[idx_bh] += dv * (vleak_j - v_new) * inv_denom;
+        grad_vleak_batch[idx_bh] += dv * gleak_j * inv_denom;
+    }
+
+    for (int i = lane; i < H; i += 32) {
+        int idx = j * H + i;
+        int idx_bhh = (b * H + j) * H + i;
+
+        float v_i = v_shared[i];
+        float sig = __ldg(&sigma[idx]);
+        float m = __ldg(&mu[idx]);
+        float z = sig * (v_i - m);
+        float act = __fdividef(1.0f, 1.0f + __expf(-z));
+        float act_deriv = act * (1.0f - act);
+
+        float w_e = __ldg(&w_erev[idx]);
+        float w_p = __ldg(&w_pos[idx]);
+        float dact = dw_num * w_e + dw_den * w_p;
+        float dz = dact * act_deriv;
+        float dv_i = dz * sig;
+
+        grad_w_erev_batch[idx_bhh] += dw_num * act;
+        grad_w_pos_batch[idx_bhh] += dw_den * act;
+        grad_mu_batch[idx_bhh] += dz * (-sig);
+        grad_sigma_batch[idx_bhh] += dz * (v_i - m);
+        atomicAdd(&grad_v_pre[b * H + i], dv_i);
+    }
+
+    if (lane == 0) {
+        atomicAdd(&grad_v_pre[b * H + j], dv * cm_j * inv_denom);
     }
 }
 
@@ -767,14 +962,14 @@ std::vector<torch::Tensor> ltc_ode_unfold_bwd(
 std::vector<torch::Tensor> ltc_full_backward(
     torch::Tensor x_seq,                // (B, T, D)
     torch::Tensor state,                 // (B, H) — initial state
-    torch::Tensor w_pos,                 // (H, H)
-    torch::Tensor w_erev,               // (H, H)
-    torch::Tensor mu,                    // (H, H)
-    torch::Tensor sigma,                 // (H, H)
-    torch::Tensor sensory_mu,            // (D, H)
-    torch::Tensor sensory_sigma,         // (D, H)
-    torch::Tensor sensory_erev,          // (D, H)
-    torch::Tensor sensory_w_pos,         // (D, H)
+    torch::Tensor w_pos_t,               // (H, H) transposed
+    torch::Tensor w_erev_t,              // (H, H) transposed
+    torch::Tensor mu_t,                  // (H, H) transposed
+    torch::Tensor sigma_t,               // (H, H) transposed
+    torch::Tensor sensory_mu_t,          // (H, D) transposed
+    torch::Tensor sensory_sigma_t,       // (H, D) transposed
+    torch::Tensor sensory_erev_t,        // (H, D) transposed
+    torch::Tensor sensory_w_pos_t,       // (H, D) transposed
     torch::Tensor cm_t,                  // (H,)
     torch::Tensor gleak_pos,             // (H,)
     torch::Tensor vleak,                 // (H,)
@@ -794,30 +989,24 @@ std::vector<torch::Tensor> ltc_full_backward(
 
     auto opts = torch::TensorOptions().dtype(torch::kFloat32).device(x_seq.device());
 
-    // Transpose all matrices for coalesced kernel access
-    auto wp_t = transpose_2d(w_pos);        // (H,H) → transposed
-    auto we_t = transpose_2d(w_erev);
-    auto mu_t = transpose_2d(mu);
-    auto sig_t = transpose_2d(sigma);
-    auto s_sig_t = transpose_2d(sensory_sigma);  // (D,H) → (H,D)
-    auto s_mu_t = transpose_2d(sensory_mu);
-    auto s_erev_t = transpose_2d(sensory_erev);
-    auto s_w_t = transpose_2d(sensory_w_pos);
+    // Per-batch accumulators remove heavy atomics on parameter gradients.
+    auto recurrent_grads_batch = torch::zeros({4, B, H, H}, opts);
+    auto grad_w_pos_batch = recurrent_grads_batch.select(0, 0);
+    auto grad_w_erev_batch = recurrent_grads_batch.select(0, 1);
+    auto grad_mu_batch = recurrent_grads_batch.select(0, 2);
+    auto grad_sigma_batch = recurrent_grads_batch.select(0, 3);
 
-    // Allocate all grad accumulators once — kernels atomicAdd directly into these
-    // Recurrent grads in transposed layout (kernel writes to j*H+i)
-    auto grad_w_pos_acc_t = torch::zeros({H, H}, opts);
-    auto grad_w_erev_acc_t = torch::zeros({H, H}, opts);
-    auto grad_mu_acc_t = torch::zeros({H, H}, opts);
-    auto grad_sigma_acc_t = torch::zeros({H, H}, opts);
-    auto grad_cm_acc = torch::zeros({H}, opts);
-    auto grad_gleak_acc = torch::zeros({H}, opts);
-    auto grad_vleak_acc = torch::zeros({H}, opts);
-    // Sensory grads in transposed (H,D) layout (kernel writes to h*D+d)
-    auto grad_sensory_mu_acc_t = torch::zeros({H, D}, opts);
-    auto grad_sensory_sigma_acc_t = torch::zeros({H, D}, opts);
-    auto grad_sensory_erev_acc_t = torch::zeros({H, D}, opts);
-    auto grad_sensory_w_pos_acc_t = torch::zeros({H, D}, opts);
+    auto scalar_grads_batch = torch::zeros({3, B, H}, opts);
+    auto grad_cm_batch = scalar_grads_batch.select(0, 0);
+    auto grad_gleak_batch = scalar_grads_batch.select(0, 1);
+    auto grad_vleak_batch = scalar_grads_batch.select(0, 2);
+
+    auto sensory_grads_batch = torch::zeros({4, B, H, D}, opts);
+    auto grad_sensory_mu_batch = sensory_grads_batch.select(0, 0);
+    auto grad_sensory_sigma_batch = sensory_grads_batch.select(0, 1);
+    auto grad_sensory_erev_batch = sensory_grads_batch.select(0, 2);
+    auto grad_sensory_w_pos_batch = sensory_grads_batch.select(0, 3);
+    auto grad_inputs_batch = torch::empty({B, H, D}, opts);
 
     auto grad_x_seq = torch::empty({B, T, D}, opts);
     auto grad_state_acc = has_grad_state
@@ -825,14 +1014,10 @@ std::vector<torch::Tensor> ltc_full_backward(
         : torch::zeros({B, H}, opts);
 
     // Intermediate buffers reused across timesteps
-    auto dw_num_buf = torch::empty({B, H}, opts);
-    auto dw_den_buf = torch::empty({B, H}, opts);
+    auto ode_sens_grads = torch::empty({2, B, H}, opts);
     auto grad_v_buf0 = torch::zeros({B, H}, opts);
     auto grad_v_buf1 = torch::zeros({B, H}, opts);
-    auto ode_grad_w_num_sens = torch::empty({B, H}, opts);
-    auto ode_grad_w_den_sens = torch::empty({B, H}, opts);
     auto dv_scratch = torch::empty({B, H}, opts);
-    auto grad_inputs_scratch = torch::empty({B, D}, opts);
 
     constexpr int BLOCK_J = 2;
     constexpr int BLOCK_H = 4;
@@ -841,45 +1026,43 @@ std::vector<torch::Tensor> ltc_full_backward(
     dim3 sens_block(32, BLOCK_H);
     dim3 sens_grid((H + BLOCK_H - 1) / BLOCK_H, B);
     int smem_state = 4 * H * sizeof(float);
-    int smem_params = H * sizeof(float);
+    int ode_sens_bytes = 2 * B * H * sizeof(float);
 
-    // Sensory backward struct — points at transposed accumulators (set once)
-    SensoryGradPtrs sens_grad_ptrs;
-    sens_grad_ptrs.grad_sigma = grad_sensory_sigma_acc_t.data_ptr<float>();
-    sens_grad_ptrs.grad_mu = grad_sensory_mu_acc_t.data_ptr<float>();
-    sens_grad_ptrs.grad_w_pos = grad_sensory_w_pos_acc_t.data_ptr<float>();
-    sens_grad_ptrs.grad_erev = grad_sensory_erev_acc_t.data_ptr<float>();
+    SensoryGradBatchPtrs sens_grad_ptrs;
+    sens_grad_ptrs.grad_sigma_batch = grad_sensory_sigma_batch.data_ptr<float>();
+    sens_grad_ptrs.grad_mu_batch = grad_sensory_mu_batch.data_ptr<float>();
+    sens_grad_ptrs.grad_w_pos_batch = grad_sensory_w_pos_batch.data_ptr<float>();
+    sens_grad_ptrs.grad_erev_batch = grad_sensory_erev_batch.data_ptr<float>();
+    sens_grad_ptrs.grad_inputs_batch = grad_inputs_batch.data_ptr<float>();
 
     // Cache transposed pointers for inner loop
-    float* w_pos_ptr = wp_t.data_ptr<float>();
-    float* w_erev_ptr = we_t.data_ptr<float>();
+    float* w_pos_ptr = w_pos_t.data_ptr<float>();
+    float* w_erev_ptr = w_erev_t.data_ptr<float>();
     float* mu_ptr = mu_t.data_ptr<float>();
-    float* sigma_ptr = sig_t.data_ptr<float>();
+    float* sigma_ptr = sigma_t.data_ptr<float>();
     float* cm_t_ptr = cm_t.data_ptr<float>();
     float* gleak_pos_ptr = gleak_pos.data_ptr<float>();
     float* vleak_ptr = vleak.data_ptr<float>();
-    float* sensory_sigma_ptr = s_sig_t.data_ptr<float>();
-    float* sensory_mu_ptr = s_mu_t.data_ptr<float>();
-    float* sensory_w_pos_ptr = s_w_t.data_ptr<float>();
-    float* sensory_erev_ptr = s_erev_t.data_ptr<float>();
-    float* dw_num_buf_ptr = dw_num_buf.data_ptr<float>();
-    float* dw_den_buf_ptr = dw_den_buf.data_ptr<float>();
-    float* grad_w_pos_ptr = grad_w_pos_acc_t.data_ptr<float>();
-    float* grad_w_erev_ptr = grad_w_erev_acc_t.data_ptr<float>();
-    float* grad_mu_ptr = grad_mu_acc_t.data_ptr<float>();
-    float* grad_sigma_ptr = grad_sigma_acc_t.data_ptr<float>();
-    float* grad_cm_ptr = grad_cm_acc.data_ptr<float>();
-    float* grad_gleak_ptr = grad_gleak_acc.data_ptr<float>();
-    float* grad_vleak_ptr = grad_vleak_acc.data_ptr<float>();
-    float* ode_w_num_sens_ptr = ode_grad_w_num_sens.data_ptr<float>();
-    float* ode_w_den_sens_ptr = ode_grad_w_den_sens.data_ptr<float>();
+    float* sensory_sigma_ptr = sensory_sigma_t.data_ptr<float>();
+    float* sensory_mu_ptr = sensory_mu_t.data_ptr<float>();
+    float* sensory_w_pos_ptr = sensory_w_pos_t.data_ptr<float>();
+    float* sensory_erev_ptr = sensory_erev_t.data_ptr<float>();
+    float* grad_w_pos_ptr = grad_w_pos_batch.data_ptr<float>();
+    float* grad_w_erev_ptr = grad_w_erev_batch.data_ptr<float>();
+    float* grad_mu_ptr = grad_mu_batch.data_ptr<float>();
+    float* grad_sigma_ptr = grad_sigma_batch.data_ptr<float>();
+    float* grad_cm_ptr = grad_cm_batch.data_ptr<float>();
+    float* grad_gleak_ptr = grad_gleak_batch.data_ptr<float>();
+    float* grad_vleak_ptr = grad_vleak_batch.data_ptr<float>();
+    float* ode_sens_ptr = ode_sens_grads.data_ptr<float>();
+    float* ode_w_num_sens_ptr = ode_sens_ptr;
+    float* ode_w_den_sens_ptr = ode_sens_ptr + B * H;
     float* grad_v_ptrs[2] = {grad_v_buf0.data_ptr<float>(), grad_v_buf1.data_ptr<float>()};
     float* v_buffers_ptr = v_buffers_stacked.data_ptr<float>();
     float* w_num_sens_ptr = w_num_sens_stacked.data_ptr<float>();
     float* w_den_sens_ptr = w_den_sens_stacked.data_ptr<float>();
     float* x_seq_ptr = x_seq.data_ptr<float>();
     float* dv_scratch_ptr = dv_scratch.data_ptr<float>();
-    float* grad_inputs_ptr = grad_inputs_scratch.data_ptr<float>();
     int x_seq_stride = T * D;  // stride between batch rows in x_seq (B, T, D)
 
     for (int t = T - 1; t >= 0; t--) {
@@ -892,10 +1075,8 @@ std::vector<torch::Tensor> ltc_full_backward(
         float* w_num_t_ptr = w_num_sens_ptr + t * B * H;
         float* w_den_t_ptr = w_den_sens_ptr + t * B * H;
 
-        // Zero per-timestep sensory accumulators only
-        // Params accumulate directly into global accumulators via atomicAdd
-        cudaMemsetAsync(ode_w_num_sens_ptr, 0, B * H * sizeof(float));
-        cudaMemsetAsync(ode_w_den_sens_ptr, 0, B * H * sizeof(float));
+        // One batched memset for both sensory accumulators.
+        cudaMemsetAsync(ode_sens_ptr, 0, ode_sens_bytes);
 
         float* grad_v_current_ptr = dv_scratch_ptr;
         int buf_idx = 0;
@@ -905,7 +1086,7 @@ std::vector<torch::Tensor> ltc_full_backward(
             float* grad_v_pre_ptr = grad_v_ptrs[buf_idx];
             cudaMemsetAsync(grad_v_pre_ptr, 0, B * H * sizeof(float));
 
-            ltc_ode_step_bwd_state_kernel<BLOCK_J><<<ode_grid, ode_block, smem_state>>>(
+            ltc_ode_step_bwd_fused_kernel<BLOCK_J><<<ode_grid, ode_block, smem_state>>>(
                 v_pre_ptr,
                 w_pos_ptr, w_erev_ptr, mu_ptr, sigma_ptr,
                 w_num_t_ptr, w_den_t_ptr,
@@ -914,17 +1095,8 @@ std::vector<torch::Tensor> ltc_full_backward(
                 grad_v_pre_ptr,
                 ode_w_num_sens_ptr, ode_w_den_sens_ptr,
                 grad_cm_ptr, grad_gleak_ptr, grad_vleak_ptr,
-                dw_num_buf_ptr, dw_den_buf_ptr,
+                grad_w_pos_ptr, grad_w_erev_ptr, grad_mu_ptr, grad_sigma_ptr,
                 B, H, epsilon
-            );
-
-            ltc_ode_step_bwd_params_kernel<BLOCK_J><<<ode_grid, ode_block, smem_params>>>(
-                v_pre_ptr,
-                mu_ptr, sigma_ptr, w_erev_ptr, w_pos_ptr,
-                dw_num_buf_ptr, dw_den_buf_ptr,
-                grad_w_pos_ptr, grad_w_erev_ptr,
-                grad_mu_ptr, grad_sigma_ptr,
-                B, H
             );
 
             grad_v_current_ptr = grad_v_ptrs[buf_idx];
@@ -936,21 +1108,32 @@ std::vector<torch::Tensor> ltc_full_backward(
 
         // Sensory backward — stride-aware, no contiguous() needed
         float* inputs_t_ptr = x_seq_ptr + t * D;
-        cudaMemsetAsync(grad_inputs_ptr, 0, B * D * sizeof(float));
 
-        ltc_sensory_bwd_kernel<BLOCK_H><<<sens_grid, sens_block>>>(
+        ltc_sensory_bwd_batch_kernel<BLOCK_H><<<sens_grid, sens_block>>>(
             ode_w_num_sens_ptr, ode_w_den_sens_ptr,
             inputs_t_ptr,
             sensory_sigma_ptr, sensory_mu_ptr,
             sensory_w_pos_ptr, sensory_erev_ptr,
-            grad_inputs_ptr,
             sens_grad_ptrs,
             B, D, H, x_seq_stride
         );
 
-        // Copy grad_inputs into grad_x_seq[:, t, :] — strided copy
-        grad_x_seq.select(1, t).copy_(grad_inputs_scratch);
+        // Reduce per-neuron input grads (B,H,D) -> (B,D) for this timestep.
+        grad_x_seq.select(1, t).copy_(grad_inputs_batch.sum(1));
     }
+
+    // Reduce batch accumulators after the full T-loop.
+    auto grad_w_pos_acc_t = grad_w_pos_batch.sum(0);
+    auto grad_w_erev_acc_t = grad_w_erev_batch.sum(0);
+    auto grad_mu_acc_t = grad_mu_batch.sum(0);
+    auto grad_sigma_acc_t = grad_sigma_batch.sum(0);
+    auto grad_cm_acc = grad_cm_batch.sum(0);
+    auto grad_gleak_acc = grad_gleak_batch.sum(0);
+    auto grad_vleak_acc = grad_vleak_batch.sum(0);
+    auto grad_sensory_mu_acc_t = grad_sensory_mu_batch.sum(0);
+    auto grad_sensory_sigma_acc_t = grad_sensory_sigma_batch.sum(0);
+    auto grad_sensory_erev_acc_t = grad_sensory_erev_batch.sum(0);
+    auto grad_sensory_w_pos_acc_t = grad_sensory_w_pos_batch.sum(0);
 
     // Transpose grads back to original layout before returning
     return {
@@ -1109,7 +1292,9 @@ std::vector<torch::Tensor> ltc_full_forward(
 
     if (save_intermediates) {
         return {outputs, state_work, v_buffers_stacked,
-                w_num_sens_stacked, w_den_sens_stacked};
+                w_num_sens_stacked, w_den_sens_stacked,
+                wp_t, we_t, mu_t, sig_t,
+                s_mu_t, s_sig_t, s_erev_t, s_w_t};
     }
     return {outputs, state_work};
 }

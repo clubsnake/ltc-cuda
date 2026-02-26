@@ -162,6 +162,50 @@ class TestLTCCudaCorrectness:
                 assert torch.allclose(param.grad, ts_grads[name], rtol=5e-2, atol=1e-2), \
                     f"Gradient mismatch for {name}: max_err={( param.grad - ts_grads[name]).abs().max().item():.2e}"
 
+    @pytest.mark.parametrize("input_scale", [0.1, 1.0, 5.0])
+    @pytest.mark.parametrize("seed", [11, 23, 47])
+    def test_backward_numerical_stability_vs_torchscript(self, input_scale, seed):
+        """CUDA backward should remain numerically close to TorchScript across scales."""
+        torch.manual_seed(seed)
+        ts_model = _create_ltc(input_dim=48, hidden_dim=24)
+        cuda_model = _create_ltc(input_dim=48, hidden_dim=24)
+        cuda_model.load_state_dict(ts_model.state_dict())
+
+        x = torch.randn(3, 6, 48, device="cuda") * input_scale
+        target = torch.randn(3, 6, 24, device="cuda") * input_scale
+
+        ts_model._force_torchscript = True
+        ts_model.zero_grad(set_to_none=True)
+        out_ts, _ = ts_model(x, None)
+        loss_ts = F.mse_loss(out_ts, target)
+        loss_ts.backward()
+        ts_grads = {n: p.grad.detach().clone() for n, p in ts_model.named_parameters() if p.grad is not None}
+
+        cuda_model._force_torchscript = False
+        cuda_model._cached_transforms = None
+        cuda_model.zero_grad(set_to_none=True)
+        out_cuda, _ = cuda_model(x, None)
+        loss_cuda = F.mse_loss(out_cuda, target)
+        loss_cuda.backward()
+
+        worst_name = ""
+        worst_rel_err = 0.0
+        for name, param in cuda_model.named_parameters():
+            if name not in ts_grads or param.grad is None:
+                continue
+            grad_ts = ts_grads[name]
+            grad_cuda = param.grad
+            assert torch.isfinite(grad_cuda).all(), f"Non-finite CUDA gradient in {name}"
+            denom = grad_ts.abs().clamp_min(1e-6)
+            rel_err = ((grad_cuda - grad_ts).abs() / denom).max().item()
+            if rel_err > worst_rel_err:
+                worst_rel_err = rel_err
+                worst_name = name
+            assert torch.allclose(grad_cuda, grad_ts, rtol=6e-2, atol=2e-2), \
+                f"Numerical mismatch ({name}) scale={input_scale} seed={seed}: rel_err={rel_err:.2e}"
+
+        assert worst_name != "", "No gradients compared"
+
     def test_saturated_sigmoids(self):
         """Extreme sigma/mu values should not cause NaN/Inf."""
         ltc = _create_ltc()
